@@ -31,6 +31,14 @@ static MAX_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// Old pools will be dropped when they go out of scope (arc refcount goes to 0)
 static POOL_GEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Bumped only in a forked child (unlike [`POOL_GEN`], which a resize bumps too).
+static FORK_GEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Lets an in-flight encode tell it crossed a fork.
+pub(crate) fn fork_generation() -> usize {
+    FORK_GEN.load(Ordering::Acquire)
+}
+
 /// register an invalidation callback to be called after a fork with pthread_atfork
 /// this is required because when forking only the parent thread is copied to the child process so
 /// you lose access to the previously built thread pool -> rebuild needed
@@ -44,6 +52,7 @@ fn register_fork_handler() {
     REGISTERED.call_once(|| {
         unsafe extern "C" fn child_after_fork() {
             POOL_GEN.fetch_add(1, Ordering::SeqCst);
+            FORK_GEN.fetch_add(1, Ordering::SeqCst);
         }
         unsafe {
             let _ = libc::pthread_atfork(None, None, Some(child_after_fork));
