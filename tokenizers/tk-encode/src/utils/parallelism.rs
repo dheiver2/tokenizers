@@ -1,5 +1,6 @@
 //! The encode thread pool and its knobs: [`max_threads`] / [`set_max_threads`].
 
+use arc_swap::{ArcSwapOption, Guard};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -44,25 +45,27 @@ fn register_fork_handler() {}
 /// The cached pool, keyed by what it was built from: a change to either rebuilds it.
 struct Slot {
     /// `None` when `max_threads()` is 1: cached too, so a serial process skips the rebuild path.
-    pool: Option<Arc<rayon::ThreadPool>>,
+    pool: Option<rayon::ThreadPool>,
     /// [`FORK_GEN`] at build time.
     fork_gen: usize,
     /// `max_threads() - 1` at build time.
     workers: usize,
 }
 
-static CELL: Mutex<Option<Slot>> = Mutex::new(None);
+/// Read without a lock: every encode looks the pool up, concurrent callers included.
+static SLOT: ArcSwapOption<Slot> = ArcSwapOption::const_empty();
 
-type MaybeLockGuard = Option<MutexGuard<'static, Option<Slot>>>;
+/// Held while (re)building the pool, so concurrent callers don't each build one.
+static BUILD: Mutex<()> = Mutex::new(());
 
-/// How many times [`lock`] retries a held lock before giving up.
+/// How many times [`lock_build`] retries a held lock before giving up.
 const LOCK_ATTEMPTS: u32 = 64;
 
-/// Take the pool lock, briefly waiting out a holder (it only guards an `Arc` clone or swap).
-/// Bounded: a child forked while the lock was held inherits it locked forever.
-fn lock() -> MaybeLockGuard {
+/// Take the build lock, briefly waiting out a holder. Bounded: a child forked while the lock was
+/// held inherits it locked forever.
+fn lock_build() -> Option<MutexGuard<'static, ()>> {
     for attempt in 0..LOCK_ATTEMPTS {
-        match CELL.try_lock() {
+        match BUILD.try_lock() {
             Ok(g) => return Some(g),
             Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
             Err(TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS / 2 => std::hint::spin_loop(),
@@ -72,22 +75,52 @@ fn lock() -> MaybeLockGuard {
     None
 }
 
-pub(crate) fn pool() -> Option<Arc<rayon::ThreadPool>> {
+/// The encode pool, borrowed from the cache without touching a shared counter.
+pub(crate) struct Pool(Guard<Option<Arc<Slot>>>);
+
+impl Pool {
+    /// The cached pool, if it was built for `fork_gen` / `workers` and has threads.
+    fn cached(fork_gen: usize, workers: usize) -> Result<Option<Self>, ()> {
+        let slot = SLOT.load();
+        match slot.as_deref() {
+            Some(s) if s.fork_gen == fork_gen && s.workers == workers => {
+                Ok(s.pool.is_some().then(|| Self(slot)))
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::ops::Deref for Pool {
+    type Target = rayon::ThreadPool;
+
+    fn deref(&self) -> &rayon::ThreadPool {
+        let slot = self
+            .0
+            .as_deref()
+            .expect("[BUG] a `Pool` always holds a slot");
+        slot.pool
+            .as_ref()
+            .expect("[BUG] a `Pool` always holds a thread pool")
+    }
+}
+
+pub(crate) fn pool() -> Option<Pool> {
     register_fork_handler();
 
     // Read once and stored as the key: a racing `set_max_threads` is caught by the next call.
     let fork_gen = fork_generation();
     // the caller is one of the `max_threads`
     let workers = max_threads() - 1;
-    // no lock: encode serially rather than build a throwaway pool
-    let mut guard = lock()?;
-    if let Some(slot) = guard.as_ref()
-        && slot.fork_gen == fork_gen
-        && slot.workers == workers
-    {
-        return slot.pool.clone();
+    if let Ok(pool) = Pool::cached(fork_gen, workers) {
+        return pool;
     }
-    // build under the lock: callers that find it held go serial instead of building their own
+    // no build lock: encode serially rather than build a throwaway pool
+    let _build = lock_build()?;
+    // another caller may have rebuilt it while we waited
+    if let Ok(pool) = Pool::cached(fork_gen, workers) {
+        return pool;
+    }
     let pool = if workers == 0 {
         None
     } else {
@@ -96,23 +129,20 @@ pub(crate) fn pool() -> Option<Arc<rayon::ThreadPool>> {
             .thread_name(|i| format!("tk-encode-{i}"))
             .build()
             .ok()?;
-        Some(Arc::new(pool))
+        Some(pool)
     };
-    let old = guard.replace(Slot {
-        pool: pool.clone(),
+    let old = SLOT.swap(Some(Arc::new(Slot {
+        pool,
         fork_gen,
         workers,
-    });
-    drop(guard);
-
+    })));
     if let Some(old) = old
         && old.fork_gen != fork_gen
     {
         // built before a fork: dropping it would wait on threads the child doesn't have
-        std::mem::forget(old.pool);
+        std::mem::forget(old);
     }
-
-    pool
+    Pool::cached(fork_gen, workers).ok().flatten()
 }
 
 /// Max threads one encode uses, caller included: the shared pool holds `max_threads() - 1`, so 1
@@ -204,7 +234,7 @@ mod tests {
                 std::thread::spawn(|| {
                     (0..2_000)
                         .filter_map(|_| pool())
-                        .map(|pool| Arc::as_ptr(&pool) as usize)
+                        .map(|pool| &*pool as *const rayon::ThreadPool as usize)
                         .collect::<std::collections::HashSet<_>>()
                 })
             })
